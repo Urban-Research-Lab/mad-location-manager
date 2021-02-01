@@ -90,6 +90,10 @@ public class ServicesHelper {
     };
 
     public static void getLocationService(Context context, SimpleTempCallback<KalmanLocationService> callback) {
+            getLocationService(context, callback, KalmanLocationService.class);
+    }
+
+    public static void getLocationService(Context context, SimpleTempCallback<KalmanLocationService> callback, Class<? extends KalmanLocationService> serviceClass) {
         if (instance.kalmanLocationService != null) {
             if (callback != null) {
                 callback.onCall(instance.kalmanLocationService);
@@ -101,7 +105,7 @@ public class ServicesHelper {
             if (!instance.connectingLocationService) {
                 instance.connectingLocationService = true;
                 Intent serviceIntent = new Intent(context.getApplicationContext(),
-                        KalmanLocationService.class);
+                        serviceClass);
                 context.getApplicationContext().bindService(serviceIntent, instance.locationServiceConnection, Context.BIND_AUTO_CREATE);
             }
         }
