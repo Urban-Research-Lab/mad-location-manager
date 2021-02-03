@@ -223,7 +223,7 @@ public class KalmanLocationService extends Service
     private LocationManager m_locationManager;
     private PowerManager m_powerManager;
     private PowerManager.WakeLock m_wakeLock;
-
+    private double lastTimestamp = 0.0;
     private boolean m_gpsEnabled = false;
     private boolean m_sensorsEnabled = false;
 
@@ -233,7 +233,6 @@ public class KalmanLocationService extends Service
 
     /**/
     private GPSAccKalmanFilter m_kalmanFilter;
-    private SensorDataEventLoopTask m_eventLoopTask;
     private List<Sensor> m_lstSensors;
     private SensorManager m_sensorManager;
     private double m_magneticDeclination = 0.0;
@@ -250,9 +249,6 @@ public class KalmanLocationService extends Service
     private float[] linearAcceleration = new float[4];
     //!
 
-    private Queue<SensorGpsDataItem> m_sensorDataQueue =
-            new PriorityBlockingQueue<>();
-
     private final HandlerThread thread = new HandlerThread("kalmanThread");
 
     private void log2File(String format, Object... args) {
@@ -260,152 +256,125 @@ public class KalmanLocationService extends Service
             m_settings.logger.log2file(format, args);
     }
 
-    class SensorDataEventLoopTask extends AsyncTask {
-        boolean needTerminate = false;
-        long deltaTMs;
-        KalmanLocationService owner;
+    ////// former asynctask methods
 
-        SensorDataEventLoopTask(long deltaTMs, KalmanLocationService owner) {
-            this.deltaTMs = deltaTMs;
-            this.owner = owner;
+    private void handlePredict(SensorGpsDataItem sdi) {
+        log2File("%d%d KalmanPredict : accX=%f, accY=%f",
+                Utils.LogMessageType.KALMAN_PREDICT.ordinal(),
+                (long) sdi.getTimestamp(),
+                sdi.getAbsEastAcc(),
+                sdi.getAbsNorthAcc());
+        m_kalmanFilter.predict(sdi.getTimestamp(), sdi.getAbsEastAcc(), sdi.getAbsNorthAcc());
+    }
+
+    private void handleUpdate(SensorGpsDataItem sdi) {
+        double xVel = sdi.getSpeed() * Math.cos(sdi.getCourse());
+        double yVel = sdi.getSpeed() * Math.sin(sdi.getCourse());
+        log2File("%d%d KalmanUpdate : pos lon=%f, lat=%f, xVel=%f, yVel=%f, posErr=%f, velErr=%f",
+                Utils.LogMessageType.KALMAN_UPDATE.ordinal(),
+                (long) sdi.getTimestamp(),
+                sdi.getGpsLon(),
+                sdi.getGpsLat(),
+                xVel,
+                yVel,
+                sdi.getPosErr(),
+                sdi.getVelErr()
+        );
+
+        m_kalmanFilter.update(
+                sdi.getTimestamp(),
+                Coordinates.longitudeToMeters(sdi.getGpsLon()),
+                Coordinates.latitudeToMeters(sdi.getGpsLat()),
+                xVel,
+                yVel,
+                sdi.getPosErr(),
+                sdi.getVelErr()
+        );
+    }
+
+    private Location locationAfterUpdateStep(SensorGpsDataItem sdi) {
+        double xVel, yVel;
+        Location loc = new Location(TAG);
+        GeoPoint pp = Coordinates.metersToGeoPoint(m_kalmanFilter.getCurrentX(),
+                m_kalmanFilter.getCurrentY());
+        loc.setLatitude(pp.Latitude);
+        loc.setLongitude(pp.Longitude);
+        loc.setAltitude(sdi.getGpsAlt());
+        xVel = m_kalmanFilter.getCurrentXVel();
+        yVel = m_kalmanFilter.getCurrentYVel();
+        double speed = Math.sqrt(xVel * xVel + yVel * yVel); //scalar speed without bearing
+        loc.setBearing((float) sdi.getCourse());
+        loc.setSpeed((float) speed);
+        loc.setTime(System.currentTimeMillis());
+        loc.setElapsedRealtimeNanos(System.nanoTime());
+        loc.setAccuracy((float) sdi.getPosErr());
+
+        if (m_geoHashRTFilter != null) {
+            m_geoHashRTFilter.filter(loc);
         }
 
-        private void handlePredict(SensorGpsDataItem sdi) {
-            log2File("%d%d KalmanPredict : accX=%f, accY=%f",
-                    Utils.LogMessageType.KALMAN_PREDICT.ordinal(),
-                    (long) sdi.getTimestamp(),
-                    sdi.getAbsEastAcc(),
-                    sdi.getAbsNorthAcc());
-            m_kalmanFilter.predict(sdi.getTimestamp(), sdi.getAbsEastAcc(), sdi.getAbsNorthAcc());
+        return loc;
+    }
+
+    @SuppressLint("DefaultLocale")
+    protected synchronized void processSensorUpdate(SensorGpsDataItem sdi) {
+        if (sdi.getTimestamp() < lastTimestamp) {
+            return;
         }
+        lastTimestamp = sdi.getTimestamp();
 
-        private void handleUpdate(SensorGpsDataItem sdi) {
-            double xVel = sdi.getSpeed() * Math.cos(sdi.getCourse());
-            double yVel = sdi.getSpeed() * Math.sin(sdi.getCourse());
-            log2File("%d%d KalmanUpdate : pos lon=%f, lat=%f, xVel=%f, yVel=%f, posErr=%f, velErr=%f",
-                    Utils.LogMessageType.KALMAN_UPDATE.ordinal(),
-                    (long) sdi.getTimestamp(),
-                    sdi.getGpsLon(),
-                    sdi.getGpsLat(),
-                    xVel,
-                    yVel,
-                    sdi.getPosErr(),
-                    sdi.getVelErr()
-            );
-
-            m_kalmanFilter.update(
-                    sdi.getTimestamp(),
-                    Coordinates.longitudeToMeters(sdi.getGpsLon()),
-                    Coordinates.latitudeToMeters(sdi.getGpsLat()),
-                    xVel,
-                    yVel,
-                    sdi.getPosErr(),
-                    sdi.getVelErr()
-            );
-        }
-
-        private Location locationAfterUpdateStep(SensorGpsDataItem sdi) {
-            double xVel, yVel;
-            Location loc = new Location(TAG);
-            GeoPoint pp = Coordinates.metersToGeoPoint(m_kalmanFilter.getCurrentX(),
-                    m_kalmanFilter.getCurrentY());
-            loc.setLatitude(pp.Latitude);
-            loc.setLongitude(pp.Longitude);
-            loc.setAltitude(sdi.getGpsAlt());
-            xVel = m_kalmanFilter.getCurrentXVel();
-            yVel = m_kalmanFilter.getCurrentYVel();
-            double speed = Math.sqrt(xVel * xVel + yVel * yVel); //scalar speed without bearing
-            loc.setBearing((float) sdi.getCourse());
-            loc.setSpeed((float) speed);
-            loc.setTime(System.currentTimeMillis());
-            loc.setElapsedRealtimeNanos(System.nanoTime());
-            loc.setAccuracy((float) sdi.getPosErr());
-
-            if (m_geoHashRTFilter != null) {
-                m_geoHashRTFilter.filter(loc);
-            }
-
-            return loc;
-        }
-
-        @SuppressLint("DefaultLocale")
-        @Override
-        protected Object doInBackground(Object[] objects) {
-            while (!needTerminate) {
-                try {
-                    Thread.sleep(deltaTMs);
-                } catch (InterruptedException e) {
-                    e.printStackTrace();
-                    continue; //bad
-                }
-
-                SensorGpsDataItem sdi;
-                double lastTimeStamp = 0.0;
-                while ((sdi = m_sensorDataQueue.poll()) != null) {
-                    if (sdi.getTimestamp() < lastTimeStamp) {
-                        continue;
-                    }
-                    lastTimeStamp = sdi.getTimestamp();
-
-                    //warning!!!
-                    if (sdi.getGpsLat() == SensorGpsDataItem.NOT_INITIALIZED) {
-                        handlePredict(sdi);
-                    } else {
-                        handleUpdate(sdi);
-                        Location loc = locationAfterUpdateStep(sdi);
-                        publishProgress(loc);
-                    }
-                }
-            }
-            return null;
-        }
-
-        @Override
-        protected void onProgressUpdate(Object... values) {
-            onLocationChangedImp((Location) values[0]);
-        }
-
-        void onLocationChangedImp(Location location) {
-            if (location == null || location.getLatitude() == 0 ||
-                    location.getLongitude() == 0 ||
-                    !location.getProvider().equals(TAG)) {
-                return;
-            }
-
-            m_serviceStatus = ServiceStatus.HAS_LOCATION;
-            m_lastLocation = location;
-            m_lastLocationAccuracy = location.getAccuracy();
-
-            if (ActivityCompat.checkSelfPermission(owner, Manifest.permission.ACCESS_FINE_LOCATION) ==
-                    PackageManager.PERMISSION_GRANTED) {
-                m_gpsStatus = m_locationManager.getGpsStatus(m_gpsStatus);
-            }
-
-            int activeSatellites = 0;
-            if (m_gpsStatus != null) {
-                for (GpsSatellite satellite : m_gpsStatus.getSatellites()) {
-                    activeSatellites += satellite.usedInFix() ? 1 : 0;
-                }
-                m_activeSatellites = activeSatellites;
-            }
-
-            for (LocationServiceInterface locationServiceInterface : m_locationServiceInterfaces) {
-                locationServiceInterface.locationChanged(location);
-            }
-            for (LocationServiceStatusInterface locationServiceStatusInterface : m_locationServiceStatusInterfaces) {
-                locationServiceStatusInterface.serviceStatusChanged(m_serviceStatus);
-                locationServiceStatusInterface.lastLocationAccuracyChanged(m_lastLocationAccuracy);
-                locationServiceStatusInterface.GPSStatusChanged(m_activeSatellites);
-            }
-
+        //warning!!!
+        if (sdi.getGpsLat() == SensorGpsDataItem.NOT_INITIALIZED) {
+            handlePredict(sdi);
+        } else {
+            handleUpdate(sdi);
+            Location loc = locationAfterUpdateStep(sdi);
+            onLocationChangedImp(loc);
         }
     }
+
+
+    void onLocationChangedImp(Location location) {
+        if (location == null || location.getLatitude() == 0 ||
+                location.getLongitude() == 0 ||
+                !location.getProvider().equals(TAG)) {
+            return;
+        }
+
+        m_serviceStatus = ServiceStatus.HAS_LOCATION;
+        m_lastLocation = location;
+        m_lastLocationAccuracy = location.getAccuracy();
+
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) ==
+                PackageManager.PERMISSION_GRANTED) {
+            m_gpsStatus = m_locationManager.getGpsStatus(m_gpsStatus);
+        }
+
+        int activeSatellites = 0;
+        if (m_gpsStatus != null) {
+            for (GpsSatellite satellite : m_gpsStatus.getSatellites()) {
+                activeSatellites += satellite.usedInFix() ? 1 : 0;
+            }
+            m_activeSatellites = activeSatellites;
+        }
+
+        for (LocationServiceInterface locationServiceInterface : m_locationServiceInterfaces) {
+            locationServiceInterface.locationChanged(location);
+        }
+        for (LocationServiceStatusInterface locationServiceStatusInterface : m_locationServiceStatusInterfaces) {
+            locationServiceStatusInterface.serviceStatusChanged(m_serviceStatus);
+            locationServiceStatusInterface.lastLocationAccuracyChanged(m_lastLocationAccuracy);
+            locationServiceStatusInterface.GPSStatusChanged(m_activeSatellites);
+        }
+
+    }
+
+    //// former asyn task methods end
 
     public KalmanLocationService() {
         m_locationServiceInterfaces = new ArrayList<>();
         m_locationServiceStatusInterfaces = new ArrayList<>();
         m_lstSensors = new ArrayList<Sensor>();
-        m_eventLoopTask = null;
         reset(defaultSettings);
     }
 
@@ -440,7 +409,6 @@ public class KalmanLocationService extends Service
 
     public void start() {
         m_wakeLock.acquire();
-        m_sensorDataQueue.clear();
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
             m_serviceStatus = ServiceStatus.PERMISSION_DENIED;
         } else {
@@ -475,9 +443,6 @@ public class KalmanLocationService extends Service
             ilss.GPSEnabledChanged(m_gpsEnabled);
         }
 
-        m_eventLoopTask = new SensorDataEventLoopTask(m_settings.positionMinTime, this);
-        m_eventLoopTask.needTerminate = false;
-        m_eventLoopTask.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
     }
 
     public void stop() {
@@ -506,11 +471,6 @@ public class KalmanLocationService extends Service
             ilss.GPSEnabledChanged(m_gpsEnabled);
         }
 
-        if (m_eventLoopTask != null) {
-            m_eventLoopTask.needTerminate = true;
-            m_eventLoopTask.cancel(true);
-        }
-        m_sensorDataQueue.clear();
     }
 
     public void reset(Settings settings) {
@@ -561,7 +521,7 @@ public class KalmanLocationService extends Service
                         SensorGpsDataItem.NOT_INITIALIZED,
                         SensorGpsDataItem.NOT_INITIALIZED,
                         m_magneticDeclination);
-                m_sensorDataQueue.add(sdi);
+                processSensorUpdate(sdi);
                 break;
             case Sensor.TYPE_ROTATION_VECTOR:
                 SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values);
@@ -638,7 +598,7 @@ public class KalmanLocationService extends Service
                 loc.getAccuracy(),
                 velErr,
                 m_magneticDeclination);
-        m_sensorDataQueue.add(sdi);
+        processSensorUpdate(sdi);
     }
 
     @Override
